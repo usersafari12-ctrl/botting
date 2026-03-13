@@ -4,7 +4,20 @@ const WebSocket = require('ws');
 const express   = require('express');
 
 const app  = express();
+
+// ── CORS — allow requests from any origin (browser portal, file://, etc.) ───
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin',  '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
+
 app.use(express.json());
+
+// ── Serve portal.html at / ───────────────────────────────────────────────────
+app.use(express.static(__dirname));
 
 // ── Mode configs ─────────────────────────────────────────────────────────────
 const MODES = {
