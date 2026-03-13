@@ -96,8 +96,13 @@ function buildPacket(bot, opts) {
 }
 
 // ── Create & run one bot ──────────────────────────────────────────────────────
-function createBot(id, url, mode, lifetimeSecs) {
+function createBot(id, url, mode, lifetimeSecs, botCount) {
     const cfg = MODES[mode];
+
+    // How long to wait after joining before starting the tick loop.
+    // Spreads bot activity evenly: if 20 bots each live 35s,
+    // stagger by 35/20 = 1.75s so they don't all act at the same moment.
+    const joinDelayMs = Math.round((lifetimeSecs / Math.max(1, botCount)) * 1000);
 
     const bot = {
         id,
@@ -174,9 +179,10 @@ function createBot(id, url, mode, lifetimeSecs) {
                 bot.ws.send(Buffer.from([0x06]));
         }, cfg.heartbeatMs);
 
+        // Delay tick start by lifetime/count seconds to stagger bot activity
         setTimeout(() => {
             bot.tickInterval = setInterval(tick, cfg.tickMs);
-        }, 600);
+        }, joinDelayMs);
     });
 
     bot.ws.on('message', (data) => {
@@ -260,7 +266,7 @@ app.post('/deploy', (req, res) => {
     for (let i = 0; i < n; i++) {
         setTimeout(() => {
             const id  = nextId++;
-            bots[id]  = createBot(id, url, mode, lifetime_);
+            bots[id]  = createBot(id, url, mode, lifetime_, n);
             deployed.push(id);
         }, i * 250);
     }
