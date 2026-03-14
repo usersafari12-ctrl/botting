@@ -1,7 +1,31 @@
 'use strict';
 
-const WebSocket = require('ws');
-const express   = require('express');
+const WebSocket    = require('ws');
+const express      = require('express');
+const admin        = require('firebase-admin');
+
+// ── Firebase Admin init ───────────────────────────────────────────────────────
+// Set FIREBASE_SERVICE_ACCOUNT env var on Render to the full JSON of your
+// service account key (Settings → Environment → Add env var).
+// Download it from Firebase Console → Project Settings → Service Accounts → Generate new private key
+let firebaseReady = false;
+try {
+    const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+    if (sa.project_id) {
+        admin.initializeApp({
+            credential: admin.credential.cert(sa),
+        });
+        firebaseReady = true;
+        console.log('[Firebase Admin] initialized for project:', sa.project_id);
+    } else {
+        console.warn('[Firebase Admin] FIREBASE_SERVICE_ACCOUNT not set — user management disabled');
+    }
+} catch(e) {
+    console.error('[Firebase Admin] init error:', e.message);
+}
+
+const db = () => firebaseReady ? admin.firestore() : null;
+const au = () => firebaseReady ? admin.auth()      : null;
 
 const app  = express();
 
@@ -9,7 +33,7 @@ const app  = express();
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin',  '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
@@ -329,6 +353,204 @@ app.delete('/kill-all', (req, res) => {
     const ids = Object.keys(bots).map(Number);
     ids.forEach(destroyBot);
     res.json({ ok: true, killed: ids });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auth middleware helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Verify Firebase ID token from Authorization: Bearer <token> header
+async function requireAuth(req, res, next) {
+    if (!firebaseReady) return res.status(503).json({ error: 'Firebase not configured' });
+    const header = req.headers.authorization || '';
+    const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Missing auth token' });
+    try {
+        req.user = await au().verifyIdToken(token);
+        next();
+    } catch(e) {
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+}
+
+// Require admin custom claim
+async function requireAdmin(req, res, next) {
+    await requireAuth(req, res, async () => {
+        if (!req.user.admin) return res.status(403).json({ error: 'Admin only' });
+        next();
+    });
+}
+
+// Get real client IP (works behind Render's proxy)
+function clientIp(req) {
+    return (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+        || req.socket.remoteAddress
+        || 'unknown';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// User IP lock endpoints
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /auth/verify-ip
+ * Called by portal on every login. Checks the user's IP against Firestore.
+ * Body: { uid }   Header: Authorization: Bearer <idToken>
+ */
+app.post('/auth/verify-ip', requireAuth, async (req, res) => {
+    const uid = req.user.uid;
+    const ip  = clientIp(req);
+
+    try {
+        const doc = await db().collection('users').doc(uid).get();
+        if (!doc.exists) {
+            return res.status(403).json({ ok: false, error: 'User not whitelisted. Contact admin.' });
+        }
+        const data = doc.data();
+
+        // Admin accounts are never IP-locked
+        if (data.admin) return res.json({ ok: true });
+
+        const allowedIp = data.allowedIp || null;
+        if (!allowedIp) {
+            // First login — record their IP automatically
+            await db().collection('users').doc(uid).update({ allowedIp: ip, lastSeen: new Date().toISOString() });
+            return res.json({ ok: true, ip });
+        }
+
+        if (allowedIp !== ip) {
+            return res.status(403).json({ ok: false, error: `IP not allowed. Expected ${allowedIp}, got ${ip}` });
+        }
+
+        await db().collection('users').doc(uid).update({ lastSeen: new Date().toISOString() });
+        res.json({ ok: true, ip });
+    } catch(e) {
+        console.error('[verify-ip]', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Admin — user management endpoints  (all require admin claim)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /admin/users
+ * Returns all users from Firebase Auth + their Firestore metadata.
+ */
+app.get('/admin/users', requireAdmin, async (req, res) => {
+    try {
+        const listResult = await au().listUsers(1000);
+        const snapshot   = await db().collection('users').get();
+        const meta = {};
+        snapshot.forEach(d => { meta[d.id] = d.data(); });
+
+        const users = listResult.users.map(u => ({
+            uid:         u.uid,
+            email:       u.email || '',
+            displayName: u.displayName || '',
+            disabled:    u.disabled,
+            created:     u.metadata.creationTime,
+            lastSignIn:  u.metadata.lastSignInTime,
+            allowedIp:   meta[u.uid]?.allowedIp  || null,
+            whitelisted: !!meta[u.uid],
+            admin:       !!(u.customClaims?.admin || meta[u.uid]?.admin),
+            lastSeen:    meta[u.uid]?.lastSeen    || null,
+        }));
+
+        res.json({ ok: true, users });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * POST /admin/whitelist
+ * Whitelist a new user by email + set their allowed IP.
+ * Body: { email, allowedIp }
+ */
+app.post('/admin/whitelist', requireAdmin, async (req, res) => {
+    const { email, allowedIp } = req.body;
+    if (!email) return res.status(400).json({ error: 'email required' });
+
+    try {
+        let userRecord;
+        try {
+            userRecord = await au().getUserByEmail(email);
+        } catch(e) {
+            return res.status(404).json({ error: `No Firebase account found for ${email}. They must sign in once first.` });
+        }
+
+        await db().collection('users').doc(userRecord.uid).set({
+            email,
+            allowedIp: allowedIp || null,
+            whitelisted: true,
+            addedAt: new Date().toISOString(),
+        }, { merge: true });
+
+        res.json({ ok: true, uid: userRecord.uid, email, allowedIp });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * POST /admin/revoke/:uid
+ * Force-revoke all sessions for a user (signs them out everywhere).
+ */
+app.post('/admin/revoke/:uid', requireAdmin, async (req, res) => {
+    try {
+        await au().revokeRefreshTokens(req.params.uid);
+        await db().collection('users').doc(req.params.uid).update({
+            revokedAt: new Date().toISOString()
+        });
+        res.json({ ok: true, revoked: req.params.uid });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * DELETE /admin/user/:uid
+ * Delete a user from Firebase Auth + remove their Firestore record.
+ */
+app.delete('/admin/user/:uid', requireAdmin, async (req, res) => {
+    try {
+        await au().deleteUser(req.params.uid);
+        await db().collection('users').doc(req.params.uid).delete();
+        res.json({ ok: true, deleted: req.params.uid });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * PATCH /admin/user/:uid
+ * Update a user's allowed IP or admin status.
+ * Body: { allowedIp?, admin? }
+ */
+app.patch('/admin/user/:uid', requireAdmin, async (req, res) => {
+    const { allowedIp, admin: isAdmin } = req.body;
+    try {
+        const updates = {};
+        if (allowedIp  !== undefined) updates.allowedIp = allowedIp;
+        if (isAdmin    !== undefined) {
+            updates.admin = isAdmin;
+            await au().setCustomUserClaims(req.params.uid, { admin: isAdmin });
+        }
+        await db().collection('users').doc(req.params.uid).update(updates);
+        res.json({ ok: true });
+    } catch(e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * GET /admin/my-ip
+ * Returns the admin's current IP — useful when whitelisting users.
+ */
+app.get('/admin/my-ip', requireAdmin, (req, res) => {
+    res.json({ ip: clientIp(req) });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
