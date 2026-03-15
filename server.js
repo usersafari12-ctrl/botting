@@ -194,10 +194,12 @@ function createBot(id, url, mode, lifetimeSecs) {
         bot.ws.send(buildPacket(bot, { slot: cfg.slot }));
         console.log(`[#${id}] joined game — ${lifetimeSecs}s lifetime`);
 
-        // Auto-kill after lifetime expires
+        // Auto-kill after lifetime expires — close directly so cycleOnDeath is preserved
         bot.killTimer = setTimeout(() => {
-            console.log(`[#${id}] lifetime expired, disconnecting`);
-            destroyBot(id);
+            console.log(`[#${id}] lifetime expired`);
+            clearInterval(bot.heartbeatInterval);
+            clearInterval(bot.tickInterval);
+            if (bot.ws) bot.ws.close();
         }, lifetimeSecs * 1000);
     });
 
@@ -213,17 +215,18 @@ function createBot(id, url, mode, lifetimeSecs) {
         clearInterval(bot.heartbeatInterval);
         clearInterval(bot.tickInterval);
 
-        // Cycle if enabled AND this wasn't a manual kill
-        if (bot.cycleOnDeath && !bot.manualKill) {
-            console.log(`[#${id}] cycling — spawning replacement`);
+        // Exact same logic as original Tampermonkey script:
+        // if cycle is on and this wasn't a manual kill, redeploy after 500ms
+        if (bot.cycleOnDeath) {
             setTimeout(() => {
                 const newId = nextId++;
-                const nb    = createBot(newId, bot.cycleUrl, bot.cycleMode, bot.cycleLifetime);
+                const nb = createBot(newId, bot.cycleUrl, bot.cycleMode, bot.cycleLifetime);
                 nb.cycleOnDeath  = true;
                 nb.cycleUrl      = bot.cycleUrl;
                 nb.cycleMode     = bot.cycleMode;
                 nb.cycleLifetime = bot.cycleLifetime;
                 bots[newId]      = nb;
+                console.log(`[cycle] spawned replacement #${newId} for dead #${id}`);
             }, 500);
         }
 
@@ -234,7 +237,7 @@ function createBot(id, url, mode, lifetimeSecs) {
         clearInterval(bot.heartbeatInterval);
         clearInterval(bot.tickInterval);
         clearTimeout(bot.killTimer);
-        bot.manualKill = true;   // prevents cycle on close
+        bot.cycleOnDeath = false;  // manual kill — no respawn
         if (bot.ws) bot.ws.close();
     };
 
