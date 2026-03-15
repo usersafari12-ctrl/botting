@@ -115,7 +115,8 @@ function createBot(id, url, mode, lifetimeSecs) {
         ws:           null,
         startedAt:    new Date().toISOString(),
         status:       'connecting',
-        cycleOnDeath: false,   // set by deploy when cycle is requested
+        manualKill:   false,
+        cycleOnDeath: false,
         cycleUrl:     url,
         cycleMode:    mode,
         cycleLifetime: lifetimeSecs,
@@ -212,20 +213,20 @@ function createBot(id, url, mode, lifetimeSecs) {
         clearInterval(bot.heartbeatInterval);
         clearInterval(bot.tickInterval);
 
-        // ── Cycle: spawn a replacement immediately on death ───────
-        if (bot.cycleOnDeath) {
+        // Cycle if enabled AND this wasn't a manual kill
+        if (bot.cycleOnDeath && !bot.manualKill) {
             console.log(`[#${id}] cycling — spawning replacement`);
             setTimeout(() => {
                 const newId = nextId++;
-                bots[newId] = createBot(newId, bot.cycleUrl, bot.cycleMode, bot.cycleLifetime);
-                bots[newId].cycleOnDeath  = true;
-                bots[newId].cycleUrl      = bot.cycleUrl;
-                bots[newId].cycleMode     = bot.cycleMode;
-                bots[newId].cycleLifetime = bot.cycleLifetime;
+                const nb    = createBot(newId, bot.cycleUrl, bot.cycleMode, bot.cycleLifetime);
+                nb.cycleOnDeath  = true;
+                nb.cycleUrl      = bot.cycleUrl;
+                nb.cycleMode     = bot.cycleMode;
+                nb.cycleLifetime = bot.cycleLifetime;
+                bots[newId]      = nb;
             }, 500);
         }
 
-        // Remove from map after a short delay so /status can still show 'dead'
         setTimeout(() => { delete bots[id]; }, 5000);
     });
 
@@ -233,7 +234,7 @@ function createBot(id, url, mode, lifetimeSecs) {
         clearInterval(bot.heartbeatInterval);
         clearInterval(bot.tickInterval);
         clearTimeout(bot.killTimer);
-        bot.cycleOnDeath = false;  // don't cycle if manually killed
+        bot.manualKill = true;   // prevents cycle on close
         if (bot.ws) bot.ws.close();
     };
 
