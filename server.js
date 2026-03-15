@@ -120,13 +120,8 @@ function buildPacket(bot, opts) {
 }
 
 // ── Create & run one bot ──────────────────────────────────────────────────────
-function createBot(id, url, mode, lifetimeSecs, botCount) {
+function createBot(id, url, mode, lifetimeSecs) {
     const cfg = MODES[mode];
-
-    // How long to wait after joining before starting the tick loop.
-    // Spreads bot activity evenly: if 20 bots each live 35s,
-    // stagger by 35/20 = 1.75s so they don't all act at the same moment.
-    const joinDelayMs = Math.round((lifetimeSecs / Math.max(1, botCount)) * 1000);
 
     const bot = {
         id,
@@ -143,6 +138,10 @@ function createBot(id, url, mode, lifetimeSecs, botCount) {
         ws:           null,
         startedAt:    new Date().toISOString(),
         status:       'connecting',
+        cycleOnDeath: false,   // set by deploy when cycle is requested
+        cycleUrl:     url,
+        cycleMode:    mode,
+        cycleLifetime: lifetimeSecs,
     };
 
     let tickCycle = 0;
@@ -187,7 +186,7 @@ function createBot(id, url, mode, lifetimeSecs, botCount) {
                           'AppleWebKit/537.36 (KHTML, like Gecko) ' +
                           'Chrome/124.0.0.0 Safari/537.36',
         },
-        rejectUnauthorized: false,   // skip TLS cert check (game server uses self-signed)
+        rejectUnauthorized: false,
     });
     bot.ws.binaryType = 'nodebuffer';
 
@@ -203,10 +202,8 @@ function createBot(id, url, mode, lifetimeSecs, botCount) {
                 bot.ws.send(Buffer.from([0x06]));
         }, cfg.heartbeatMs);
 
-        // Delay tick start by lifetime/count seconds to stagger bot activity
-        setTimeout(() => {
-            bot.tickInterval = setInterval(tick, cfg.tickMs);
-        }, joinDelayMs);
+        // Start ticking immediately — no delay
+        bot.tickInterval = setInterval(tick, cfg.tickMs);
     });
 
     bot.ws.on('message', (data) => {
@@ -237,6 +234,20 @@ function createBot(id, url, mode, lifetimeSecs, botCount) {
         console.log(`[#${id}] closed (code ${code})`);
         clearInterval(bot.heartbeatInterval);
         clearInterval(bot.tickInterval);
+
+        // ── Cycle: spawn a replacement immediately on death ───────
+        if (bot.cycleOnDeath) {
+            console.log(`[#${id}] cycling — spawning replacement`);
+            setTimeout(() => {
+                const newId = nextId++;
+                bots[newId] = createBot(newId, bot.cycleUrl, bot.cycleMode, bot.cycleLifetime);
+                bots[newId].cycleOnDeath  = true;
+                bots[newId].cycleUrl      = bot.cycleUrl;
+                bots[newId].cycleMode     = bot.cycleMode;
+                bots[newId].cycleLifetime = bot.cycleLifetime;
+            }, 500);
+        }
+
         // Remove from map after a short delay so /status can still show 'dead'
         setTimeout(() => { delete bots[id]; }, 5000);
     });
@@ -245,6 +256,7 @@ function createBot(id, url, mode, lifetimeSecs, botCount) {
         clearInterval(bot.heartbeatInterval);
         clearInterval(bot.tickInterval);
         clearTimeout(bot.killTimer);
+        bot.cycleOnDeath = false;  // don't cycle if manually killed
         if (bot.ws) bot.ws.close();
     };
 
@@ -274,7 +286,7 @@ function destroyBot(id) {
  * }
  */
 app.post('/deploy', (req, res) => {
-    const { url, count = 1, mode = 'lag', lifetime = 35 } = req.body;
+    const { url, count = 1, mode = 'lag', lifetime = 35, cycle = false } = req.body;
 
     if (!url || !url.startsWith('wss://')) {
         return res.status(400).json({ error: 'url must start with wss://' });
@@ -282,34 +294,27 @@ app.post('/deploy', (req, res) => {
     if (!MODES[mode]) {
         return res.status(400).json({ error: 'mode must be "lag" or "pillar"' });
     }
-    const n        = Math.min(50, Math.max(1, parseInt(count)  || 1));
+    const n         = Math.min(50, Math.max(1, parseInt(count)   || 1));
     const lifetime_ = Math.min(300, Math.max(1, parseInt(lifetime) || 35));
-
-    const deployed = [];
 
     for (let i = 0; i < n; i++) {
         setTimeout(() => {
             const id  = nextId++;
-            bots[id]  = createBot(id, url, mode, lifetime_, n);
-            deployed.push(id);
+            const bot = createBot(id, url, mode, lifetime_);
+            bot.cycleOnDeath  = !!cycle;
+            bot.cycleUrl      = url;
+            bot.cycleMode     = mode;
+            bot.cycleLifetime = lifetime_;
+            bots[id] = bot;
         }, i * 250);
     }
 
-    // IDs are assigned asynchronously due to setTimeout stagger,
-    // so we return the ID range that will be assigned.
-    const firstId = nextId;
-    const lastId  = nextId + n - 1;
-    nextId += n;
-
-    // Re-do synchronously to get real IDs back in the response
-    // (reset nextId and rebuild)
-    // Simpler: just return count + mode, client can hit /status
     return res.json({
         ok:       true,
         deploying: n,
         mode,
         lifetime: lifetime_,
-        note:     'Call GET /status to see bot IDs',
+        cycle:    !!cycle,
     });
 });
 
